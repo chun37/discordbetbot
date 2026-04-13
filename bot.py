@@ -41,6 +41,7 @@ class BetBot(commands.Bot):
         # 3. Load cogs
         await self.load_extension("cogs.bets")
         await self.load_extension("cogs.wallet")
+        await self.load_extension("cogs.help")
 
         # 4. Restore pending schedules from DB
         await self.scheduler.restore()

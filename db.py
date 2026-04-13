@@ -311,3 +311,92 @@ class Database:
             "UPDATE schedules SET fired=1 WHERE bet_id=?",
             (bet_id,),
         )
+
+    # ------------------------------------------------------------------
+    # User-centric read queries
+    # ------------------------------------------------------------------
+
+    async def fetch_user_open_entries(self, user_id: int) -> list[aiosqlite.Row]:
+        async with self.conn.execute(
+            """
+            SELECT e.*, b.target, b.channel_id, b.message_id,
+                   b.created_at AS bet_created_at
+            FROM entries e
+            INNER JOIN bets b ON e.bet_id = b.bet_id
+            WHERE e.user_id = ? AND b.status = 'open'
+            ORDER BY b.bet_id, e.period_key, e.entry_id
+            """,
+            (user_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def fetch_entries_for_bets(self, bet_ids: list[int]) -> list[aiosqlite.Row]:
+        if not bet_ids:
+            return []
+        placeholders = ",".join("?" * len(bet_ids))
+        async with self.conn.execute(
+            f"SELECT * FROM entries WHERE bet_id IN ({placeholders}) ORDER BY bet_id, entry_id",
+            bet_ids,
+        ) as cur:
+            return await cur.fetchall()
+
+    async def fetch_user_closed_entries(
+        self,
+        user_id: int,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> list[aiosqlite.Row]:
+        async with self.conn.execute(
+            """
+            SELECT e.*, b.target, b.closed_at, b.winning_periods
+            FROM entries e
+            INNER JOIN bets b ON e.bet_id = b.bet_id
+            WHERE e.user_id = ? AND b.status = 'closed'
+            ORDER BY b.closed_at DESC, e.entry_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (user_id, limit, offset),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def count_user_closed_entries(self, user_id: int) -> int:
+        async with self.conn.execute(
+            """
+            SELECT COUNT(*) FROM entries e
+            INNER JOIN bets b ON e.bet_id = b.bet_id
+            WHERE e.user_id = ? AND b.status = 'closed'
+            """,
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0]
+
+    async def fetch_user_all_events_for_graph(self, user_id: int) -> list[aiosqlite.Row]:
+        async with self.conn.execute(
+            """
+            SELECT e.entry_id, e.bet_id, e.user_id, e.created_at, e.payout,
+                   b.status, b.closed_at,
+                   (SELECT MIN(entry_id) FROM entries
+                    WHERE bet_id = e.bet_id AND user_id = e.user_id) AS first_entry_id
+            FROM entries e
+            INNER JOIN bets b ON e.bet_id = b.bet_id
+            WHERE e.user_id = ?
+            ORDER BY e.created_at, e.entry_id
+            """,
+            (user_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+    async def fetch_active_participant_ids(self) -> list[int]:
+        async with self.conn.execute(
+            """
+            SELECT DISTINCT e.user_id
+            FROM entries e
+            INNER JOIN bets b ON e.bet_id = b.bet_id
+            WHERE b.status = 'open'
+            ORDER BY e.user_id
+            LIMIT 25
+            """,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [r["user_id"] for r in rows]

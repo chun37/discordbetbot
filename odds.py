@@ -166,6 +166,19 @@ def calc_payouts(
     return result
 
 
+def calc_best_case_payout(
+    period_key: str,
+    my_weighted_amount: int,
+    group_weighted_amount: int,
+    total_pool: int,
+) -> int:
+    """該当 period が k=1 で勝った場合の理論上限払戻。DB 非依存の純関数。"""
+    if group_weighted_amount == 0:
+        return 0
+    mult = PERIOD_MULT[period_key]
+    return round(mult * total_pool * my_weighted_amount / group_weighted_amount)
+
+
 def _distribute_group(
     all_entries: list[EntryInput],
     group: list[EntryInput],
