@@ -135,18 +135,22 @@ def build_participation_embed(
     bet_id: int,
     period_key: str,
     new_balance: int,
+    first_time: bool = True,
 ) -> discord.Embed:
     label = PERIOD_LABELS[period_key]
-    embed = discord.Embed(
-        title="参加完了",
-        description=(
+    if first_time:
+        desc = (
             f"賭け **#{bet_id}** の **{label}** に参加しました。\n"
-            f"−100P（賭け金）＋500P（ボーナス）= **+400P 純増**\n"
+            f"−100P（賭け金）＋500P（初回ボーナス）= **+400P 純増**\n"
             f"現在残高: **{new_balance}P**"
-        ),
-        color=discord.Color.green(),
-    )
-    return embed
+        )
+    else:
+        desc = (
+            f"賭け **#{bet_id}** の **{label}** に **追加参加** しました。\n"
+            f"−100P（賭け金のみ、ボーナスは初回のみ）\n"
+            f"現在残高: **{new_balance}P**"
+        )
+    return discord.Embed(title="参加完了", description=desc, color=discord.Color.green())
 
 
 def _iso_to_unix(iso: str) -> int:

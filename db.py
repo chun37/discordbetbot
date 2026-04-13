@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -65,6 +66,7 @@ class Database:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._conn: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,16 +109,17 @@ class Database:
     # ------------------------------------------------------------------
 
     async def execute_write(self, fn):
-        """Run fn(conn) inside a BEGIN IMMEDIATE transaction."""
-        async with self.conn.execute("BEGIN IMMEDIATE"):
-            pass
-        try:
-            result = await fn(self.conn)
-            await self.conn.commit()
-            return result
-        except Exception:
-            await self.conn.rollback()
-            raise
+        """Run fn(conn) inside a BEGIN IMMEDIATE transaction, serialized by a lock."""
+        async with self._write_lock:
+            async with self.conn.execute("BEGIN IMMEDIATE"):
+                pass
+            try:
+                result = await fn(self.conn)
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
 
     # ------------------------------------------------------------------
     # Bets

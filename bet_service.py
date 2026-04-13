@@ -50,6 +50,7 @@ class ParticipationResult:
     entry_id: int
     period_key: str
     new_balance: int
+    first_time: bool
 
 
 @dataclass
@@ -114,7 +115,6 @@ async def join_bet(
 
     async def _tx(conn):
         # Fetch bet inside transaction
-        from aiosqlite import Connection
         async with conn.execute(
             "SELECT * FROM bets WHERE bet_id=?", (bet_id,)
         ) as cur:
@@ -125,6 +125,13 @@ async def join_bet(
         if bet["status"] != "open":
             raise BetAlreadyClosed(f"Bet #{bet_id} is already closed")
 
+        # First-time-per-bet detection (inside tx for consistency)
+        async with conn.execute(
+            "SELECT 1 FROM entries WHERE bet_id=? AND user_id=? LIMIT 1",
+            (bet_id, user_id),
+        ) as cur:
+            first_time = (await cur.fetchone()) is None
+
         live = await db.fetch_live_periods_tx(conn, bet_id)
         if period_key not in live:
             raise PeriodEliminated(f"Period {period_key} has already been eliminated")
@@ -134,19 +141,28 @@ async def join_bet(
         entry_id = await db.insert_entry_tx(
             conn, bet_id, user_id, period_key, 100, weight, now
         )
-        # +500 bonus - 100 stake = +400 net
-        await db.upsert_balance_tx(conn, user_id, 400)
+        # First join: +500 bonus - 100 stake = +400 net; subsequent: -100 only
+        delta = 400 if first_time else -100
+        await db.upsert_balance_tx(conn, user_id, delta)
 
-        return entry_id, bet["channel_id"]
+        return entry_id, bet["channel_id"], first_time
 
-    entry_id, channel_id = await db.execute_write(_tx)
+    entry_id, channel_id, first_time = await db.execute_write(_tx)
 
     # Read new balance outside tx
     new_balance = await db.fetch_balance(user_id)
     refresher.schedule(channel_id, bet_id)
 
-    logger.info("User %d joined bet #%d period=%s entry_id=%d", user_id, bet_id, period_key, entry_id)
-    return ParticipationResult(entry_id=entry_id, period_key=period_key, new_balance=new_balance)
+    logger.info(
+        "User %d joined bet #%d period=%s entry_id=%d first_time=%s",
+        user_id, bet_id, period_key, entry_id, first_time,
+    )
+    return ParticipationResult(
+        entry_id=entry_id,
+        period_key=period_key,
+        new_balance=new_balance,
+        first_time=first_time,
+    )
 
 
 async def close_bet(
@@ -236,7 +252,15 @@ async def close_bet(
             message = await channel.fetch_message(bet["message_id"])
             await message.edit(embed=result_embed, view=None)
         except Exception:
-            logger.exception("Failed to edit message for bet #%d", bet_id)
+            logger.exception("Failed to edit original message for bet #%d", bet_id)
+        # Post a fresh public message so users get a new-message notification
+        try:
+            await channel.send(
+                content=f"⏰ 賭け **#{bet_id}** が終了しました",
+                embed=result_embed,
+            )
+        except Exception:
+            logger.warning("Failed to send public result for bet #%d", bet_id)
 
     logger.info(
         "Bet #%d closed by user %d — elapsed=%.0fs winners=%s",
