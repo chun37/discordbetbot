@@ -1,4 +1,4 @@
-"""Domain lifecycle tests — no DB, no Discord, no async."""
+"""ドメインロジックのテスト — DB・Discord・async 不要。"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -37,7 +37,7 @@ def _make_bet(
 
 
 class _EntryFactory:
-    """Convenience factory that auto-increments entry_id."""
+    """entry_id を自動採番するファクトリ。"""
 
     def __init__(self, bet_id: int = 1) -> None:
         self.bet_id = bet_id
@@ -103,7 +103,7 @@ class TestValidateJoin:
 
 class TestSettle:
     def test_basic_single_winner(self):
-        """1 user bets on winning period, 1 on losing — winner gets payout."""
+        """勝ち period に賭けた人が配当を得て、負けた人は 0。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         entries = [
@@ -112,17 +112,17 @@ class TestSettle:
         ]
         live = ["1w", "2w", "1mo", "3mo", "6mo", "1y"]
 
-        # Close at exactly 1 week → k=1, winner="1w"
+        # ちょうど 1 週間で締め → k=1, 勝ち="1w"
         now = _utc() + timedelta(seconds=PERIOD_SECONDS["1w"])
         result = settle(bet, entries, live, actor_user_id=100, now=now)
 
         assert result.winners == ["1w"]
         assert result.k == pytest.approx(1.0)
-        assert result.payouts[1] > 0   # winner
-        assert result.payouts[2] == 0  # loser
+        assert result.payouts[1] > 0   # 勝者
+        assert result.payouts[2] == 0  # 敗者
 
     def test_all_same_period(self):
-        """All entries on the same winning period — pool split by weight."""
+        """全員が同じ勝ち period に賭けた場合 — weight で按分。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         entries = [
@@ -135,12 +135,12 @@ class TestSettle:
         result = settle(bet, entries, live, actor_user_id=100, now=now)
 
         assert result.winners == ["1w"]
-        # Equal weight → equal payout
+        # weight 同一 → 配当も同額
         assert result.payouts[1] == result.payouts[2]
         assert result.payouts[1] > 0
 
     def test_no_bets_on_winner_returns_stake(self):
-        """Nobody bet on the winning period — everyone gets their stake back."""
+        """勝ち period に誰も賭けていない場合 — 全員に賭け金を返金。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         entries = [
@@ -167,14 +167,14 @@ class TestSettle:
             settle(bet, [], list(PERIOD_KEYS), actor_user_id=100, now=_utc())
 
     def test_no_entries(self):
-        """Closing a bet with zero entries returns empty payouts."""
+        """参加者ゼロで締めた場合 — 配当は空。"""
         bet = _make_bet(created_at=_utc())
         now = _utc() + timedelta(days=1)
         result = settle(bet, [], list(PERIOD_KEYS), actor_user_id=100, now=now)
         assert result.payouts == {}
 
     def test_k_factor_less_than_one(self):
-        """When elapsed != period milestone, k < 1."""
+        """経過時間が period のマイルストーンと一致しない場合、k < 1。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         entries = [
@@ -182,7 +182,7 @@ class TestSettle:
         ]
         live = ["1w", "2w", "1mo", "3mo", "6mo", "1y"]
 
-        # Close at 700,000s (close to 1w=604800, but not exact)
+        # 700,000秒で締め（1w=604800 に近いが一致しない）
         now = _utc() + timedelta(seconds=700_000)
         result = settle(bet, entries, live, actor_user_id=100, now=now)
 
@@ -199,66 +199,66 @@ class TestSettle:
 
 class TestLifecycle:
     def test_create_join_settle(self):
-        """End-to-end: create bet, two users join, settle."""
+        """賭け作成 → 2人参加 → 決済の一連フロー。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         all_periods = list(PERIOD_KEYS)
         entries: list[Entry] = []
 
-        # User A joins "1w"
+        # ユーザー A が "1w" に参加
         d1 = validate_join(bet, entries, all_periods, user_id=200, period_key="1w")
         assert d1.first_time is True
         entries.append(f.create(200, "1w", d1.weight))
 
-        # User B joins "1mo"
+        # ユーザー B が "1mo" に参加
         d2 = validate_join(bet, entries, all_periods, user_id=300, period_key="1mo")
         assert d2.first_time is True
         entries.append(f.create(300, "1mo", d2.weight))
 
-        # User A joins "1w" again (repeat)
+        # ユーザー A が "1w" に再参加（ボーナスなし）
         d3 = validate_join(bet, entries, all_periods, user_id=200, period_key="1w")
         assert d3.first_time is False
         assert d3.balance_delta == -100
         entries.append(f.create(200, "1w", d3.weight))
 
-        # Settle at 1 week exactly → "1w" wins
+        # ちょうど 1 週間で決済 → "1w" が勝ち
         now = _utc() + timedelta(seconds=PERIOD_SECONDS["1w"])
         result = settle(bet, entries, all_periods, actor_user_id=100, now=now)
 
         assert result.winners == ["1w"]
         assert result.k == pytest.approx(1.0)
-        # User A's two entries should both get payouts
-        assert result.payouts[1] > 0  # entry 1 (user A, 1w)
-        assert result.payouts[3] > 0  # entry 3 (user A, 1w)
-        # User B (1mo) loses
+        # ユーザー A の 2 エントリ両方に配当
+        assert result.payouts[1] > 0  # エントリ 1 (A, 1w)
+        assert result.payouts[3] > 0  # エントリ 3 (A, 1w)
+        # ユーザー B (1mo) は敗北
         assert result.payouts[2] == 0
 
     def test_lifecycle_with_period_elimination(self):
-        """Simulate period elimination narrowing live periods."""
+        """期間消滅により live_periods が減る状況をシミュレート。"""
         bet = _make_bet(created_at=_utc())
         f = _EntryFactory()
         entries: list[Entry] = []
 
-        # Initially all periods live
+        # 初期は全期間が有効
         all_periods = list(PERIOD_KEYS)
 
-        # User A joins early (all 8 periods live → high weight)
+        # ユーザー A が早期参加（全 8 期間有効 → 高 weight）
         d1 = validate_join(bet, entries, all_periods, user_id=200, period_key="3mo")
         assert d1.weight == 64  # 8^2
         entries.append(f.create(200, "3mo", d1.weight))
 
-        # After 1d and 3d pass, only 6 periods remain live
+        # 1d, 3d が経過し、残り 6 期間
         later_live = ["1w", "2w", "1mo", "3mo", "6mo", "1y"]
 
-        # User B joins later (6 periods live → lower weight)
+        # ユーザー B が後から参加（6 期間有効 → 低 weight）
         d2 = validate_join(bet, entries, later_live, user_id=300, period_key="3mo")
         assert d2.weight == 36  # 6^2
         entries.append(f.create(300, "3mo", d2.weight))
 
-        # Settle at 3 months
+        # 3 か月で決済
         now = _utc() + timedelta(seconds=PERIOD_SECONDS["3mo"])
         result = settle(bet, entries, later_live, actor_user_id=100, now=now)
 
         assert result.winners == ["3mo"]
-        # User A bet earlier → higher weight → higher payout
+        # ユーザー A は早期参加 → 高 weight → 高配当
         assert result.payouts[1] > result.payouts[2]
