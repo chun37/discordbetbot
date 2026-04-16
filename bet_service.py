@@ -1,5 +1,6 @@
 """
-Neutral service layer — imported by both cogs/ and views/.
+Application service layer — orchestrates domain logic, DB, and Discord.
+
 Must NOT import from cogs/ or views/ to avoid circular imports.
 """
 from __future__ import annotations
@@ -12,7 +13,18 @@ from typing import TYPE_CHECKING, Any
 import discord
 
 import odds as odds_module
-from embeds import build_bet_embed, build_participation_embed, build_result_embed
+from domain.models import (
+    Bet,
+    BetAlreadyClosed,
+    BetError,
+    BetNotFound,
+    Entry,
+    NotAllowed,
+    PeriodEliminated,
+)
+from domain.services import settle as domain_settle
+from domain.services import validate_join as domain_validate_join
+from embeds import build_bet_embed, build_result_embed
 
 if TYPE_CHECKING:
     from embed_refresher import EmbedRefresher
@@ -20,29 +32,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Re-export domain exceptions so existing callers (views, cogs) keep working.
+__all__ = [
+    "BetError",
+    "BetNotFound",
+    "BetAlreadyClosed",
+    "NotAllowed",
+    "PeriodEliminated",
+    "ParticipationResult",
+    "SettleResult",
+    "create_bet",
+    "join_bet",
+    "close_bet",
+]
+
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
-
-
-class BetError(Exception):
-    """Base class for bet service errors."""
-
-
-class BetNotFound(BetError):
-    pass
-
-
-class BetAlreadyClosed(BetError):
-    pass
-
-
-class NotAllowed(BetError):
-    pass
-
-
-class PeriodEliminated(BetError):
-    pass
 
 
 @dataclass
@@ -61,6 +67,46 @@ class SettleResult:
     k: float
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_datetime(iso: str) -> datetime:
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _row_to_bet(row: Any) -> Bet:
+    return Bet(
+        bet_id=row["bet_id"],
+        creator_id=row["creator_id"],
+        target=row["target"],
+        created_at=_parse_datetime(row["created_at"]),
+        status=row["status"],
+    )
+
+
+def _rows_to_entries(rows: list[Any]) -> list[Entry]:
+    return [
+        Entry(
+            entry_id=r["entry_id"],
+            bet_id=r["bet_id"],
+            user_id=r["user_id"],
+            period_key=r["period_key"],
+            amount=r["amount"],
+            weight=r["weight"],
+            payout=r["payout"],
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Application service functions
+# ---------------------------------------------------------------------------
+
 async def create_bet(
     bot: Any,
     creator_id: int,
@@ -69,7 +115,6 @@ async def create_bet(
 ) -> int:
     from db import Database
     from scheduler import Scheduler
-    from embed_refresher import EmbedRefresher
 
     db: Database = bot.db
     scheduler: Scheduler = bot.scheduler
@@ -118,34 +163,32 @@ async def join_bet(
         async with conn.execute(
             "SELECT * FROM bets WHERE bet_id=?", (bet_id,)
         ) as cur:
-            bet = await cur.fetchone()
+            bet_row = await cur.fetchone()
 
-        if bet is None:
+        if bet_row is None:
             raise BetNotFound(f"Bet #{bet_id} not found")
-        if bet["status"] != "open":
-            raise BetAlreadyClosed(f"Bet #{bet_id} is already closed")
 
-        # First-time-per-bet detection (inside tx for consistency)
+        bet = _row_to_bet(bet_row)
+
+        # Fetch existing entries for first-time detection
         async with conn.execute(
-            "SELECT 1 FROM entries WHERE bet_id=? AND user_id=? LIMIT 1",
-            (bet_id, user_id),
+            "SELECT * FROM entries WHERE bet_id=?", (bet_id,)
         ) as cur:
-            first_time = (await cur.fetchone()) is None
+            entry_rows = await cur.fetchall()
 
+        entries = _rows_to_entries(entry_rows)
         live = await db.fetch_live_periods_tx(conn, bet_id)
-        if period_key not in live:
-            raise PeriodEliminated(f"Period {period_key} has already been eliminated")
 
-        weight = odds_module.calc_weight(len(live))
+        # --- Domain logic (pure) ---
+        decision = domain_validate_join(bet, entries, live, user_id, period_key)
 
+        # --- Persist ---
         entry_id = await db.insert_entry_tx(
-            conn, bet_id, user_id, period_key, 100, weight, now
+            conn, bet_id, user_id, period_key, decision.amount, decision.weight, now
         )
-        # First join: +500 bonus - 100 stake = +400 net; subsequent: -100 only
-        delta = 400 if first_time else -100
-        await db.upsert_balance_tx(conn, user_id, delta)
+        await db.upsert_balance_tx(conn, user_id, decision.balance_delta)
 
-        return entry_id, bet["channel_id"], first_time
+        return entry_id, bet_row["channel_id"], decision.first_time
 
     entry_id, channel_id, first_time = await db.execute_write(_tx)
 
@@ -176,56 +219,33 @@ async def close_bet(
     db: Database = bot.db
     scheduler: Scheduler = bot.scheduler
 
-    bet = await db.fetch_bet(bet_id)
-    if bet is None:
+    bet_row = await db.fetch_bet(bet_id)
+    if bet_row is None:
         raise BetNotFound(f"Bet #{bet_id} not found")
-    if bet["status"] != "open":
-        raise BetAlreadyClosed(f"Bet #{bet_id} is already closed")
-    if bet["creator_id"] != actor_user_id:
-        raise NotAllowed("Only the creator can close this bet")
 
-    created_dt = datetime.fromisoformat(bet["created_at"].replace("Z", "+00:00"))
-    if created_dt.tzinfo is None:
-        from datetime import timezone as _tz
-        created_dt = created_dt.replace(tzinfo=_tz.utc)
-
+    bet = _row_to_bet(bet_row)
     now = _utcnow()
-    elapsed_sec = max(0.0, (now - created_dt).total_seconds())
-    closed_at = now.isoformat()
 
     entries_rows = await db.fetch_bet_entries(bet_id)
+    entries = _rows_to_entries(entries_rows)
     live_keys = await db.fetch_live_periods_tx(db.conn, bet_id)
 
-    winners = odds_module.find_winners(elapsed_sec, live_keys)
-    total_pool = len(entries_rows) * 100
+    # --- Domain logic (pure) ---
+    decision = domain_settle(bet, entries, live_keys, actor_user_id, now)
 
-    entry_inputs = [
-        odds_module.EntryInput(
-            entry_id=e["entry_id"],
-            period_key=e["period_key"],
-            amount=e["amount"],
-            weight=e["weight"],
-        )
-        for e in entries_rows
-    ]
-
-    payouts = odds_module.calc_payouts(entry_inputs, winners, elapsed_sec, total_pool)
-
-    # Determine k for result display
-    if winners:
-        w_sec = odds_module.PERIOD_SECONDS[winners[0]]
-        k = min(w_sec, elapsed_sec) / max(w_sec, elapsed_sec) if max(w_sec, elapsed_sec) > 0 else 0.0
-    else:
-        k = 0.0
+    # --- Persist ---
+    closed_at = now.isoformat()
 
     async def _settle_tx(conn):
         for e in entries_rows:
-            payout = payouts.get(e["entry_id"], 0)
+            payout = decision.payouts.get(e["entry_id"], 0)
             await db.update_entry_payout_tx(conn, e["entry_id"], payout)
             if payout > 0:
                 await db.upsert_balance_tx(conn, e["user_id"], payout)
 
-        await db.close_bet_tx(conn, bet_id, closed_at, int(elapsed_sec), winners)
+        await db.close_bet_tx(
+            conn, bet_id, closed_at, int(decision.elapsed_sec), decision.winners
+        )
         await db.mark_schedules_fired_for_bet_tx(conn, bet_id)
 
     await db.execute_write(_settle_tx)
@@ -237,19 +257,23 @@ async def close_bet(
     settled_entries = await db.fetch_bet_entries(bet_id)
 
     # Build result embed and edit the original message
-    result_embed = build_result_embed(bet, settled_entries, winners, elapsed_sec, k)
+    result_embed = build_result_embed(
+        bet_row, settled_entries, decision.winners, decision.elapsed_sec, decision.k
+    )
 
-    channel = bot.get_channel(bet["channel_id"])
+    channel = bot.get_channel(bet_row["channel_id"])
     if channel is None:
         try:
-            channel = await bot.fetch_channel(bet["channel_id"])
+            channel = await bot.fetch_channel(bet_row["channel_id"])
         except Exception:
-            logger.warning("Cannot find channel %s for bet #%d", bet["channel_id"], bet_id)
+            logger.warning(
+                "Cannot find channel %s for bet #%d", bet_row["channel_id"], bet_id
+            )
             channel = None
 
     if channel:
         try:
-            message = await channel.fetch_message(bet["message_id"])
+            message = await channel.fetch_message(bet_row["message_id"])
             await message.edit(embed=result_embed, view=None)
         except Exception:
             logger.exception("Failed to edit original message for bet #%d", bet_id)
@@ -264,6 +288,11 @@ async def close_bet(
 
     logger.info(
         "Bet #%d closed by user %d — elapsed=%.0fs winners=%s",
-        bet_id, actor_user_id, elapsed_sec, winners,
+        bet_id, actor_user_id, decision.elapsed_sec, decision.winners,
     )
-    return SettleResult(bet_id=bet_id, winners=winners, elapsed_sec=elapsed_sec, k=k)
+    return SettleResult(
+        bet_id=bet_id,
+        winners=decision.winners,
+        elapsed_sec=decision.elapsed_sec,
+        k=decision.k,
+    )
