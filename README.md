@@ -75,15 +75,14 @@ config.py             .env 読み込み
 
 # ── ドメイン層（純粋ロジック、I/O なし） ─────────────────
 domain/
-  models.py           Bet / Entry / 例外 / JoinDecision / SettleDecision
-  services.py         validate_join() / settle()（純関数）
+  models.py           Bet（アグリゲート）/ Entry / 例外 / Decision 型
   odds.py             配当計算（純関数）
 
 # ── DB 層 ──────────────────────────────────────────────
 db.py                 aiosqlite、スキーマ、クエリ
 
 # ── UI / オーケストレーション層 ──────────────────────────
-bet_service.py        ドメイン関数を呼び出して DB + Discord に反映
+bet_service.py        Bet アグリゲートを DB から構築 → メソッド呼び出し → DB + Discord に反映
 scheduler.py          期間経過通知タスク
 embeds.py             Embed 構築
 embed_refresher.py    デバウンス更新 (5 edits/5s 対策)
@@ -91,7 +90,7 @@ views/                DynamicItem ボタン・Select
 cogs/                 スラッシュコマンド
 
 # ── テスト ────────────────────────────────────────────
-tests/test_domain.py  ドメインライフサイクルのテスト
+tests/test_domain.py  Bet ライフサイクルのテスト
 tests/test_odds.py    配当計算のテスト
 
 odds.py               domain/odds からの後方互換 re-export
@@ -99,18 +98,23 @@ odds.py               domain/odds からの後方互換 re-export
 
 ### ドメインロジックのテスト
 
-賭け作成 → 参加 → 決済の一連の流れを DB・Discord 抜きで検証できます。
+`Bet` がアグリゲートルートとして参加・消滅・締め切りの各操作をメソッドで提供。
+DB や Discord なしで一連の流れを検証できます。
 
 ```python
-from domain.models import Bet, Entry
-from domain.services import validate_join, settle
+from domain.models import Bet
 
-bet = Bet(bet_id=1, creator_id=100, target="test", created_at=now, status="open")
+bet = Bet(bet_id=1, creator_id=100, target="test", created_at=now)
 
-# 参加判断
-decision = validate_join(bet, entries=[], live_periods=[...], user_id=200, period_key="1w")
+# 参加
+bet.place_bet(user_id=200, period_key="1w")
+bet.place_bet(user_id=300, period_key="1mo")
 
-# 決済
-result = settle(bet, entries, live_periods, actor_user_id=100, now=close_time)
+# 期間消滅（マイルストーン経過のシミュレート）
+bet.eliminate_period("1d")
+
+# 締め切り・配当計算
+result = bet.close(actor_user_id=100, now=close_time)
 # → result.winners, result.payouts, result.k
+# → bet.entries[i].payout にも反映済み
 ```

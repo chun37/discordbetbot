@@ -22,8 +22,6 @@ from domain.models import (
     NotAllowed,
     PeriodEliminated,
 )
-from domain.services import settle as domain_settle
-from domain.services import validate_join as domain_validate_join
 from embeds import build_bet_embed, build_result_embed
 
 if TYPE_CHECKING:
@@ -78,16 +76,6 @@ def _parse_datetime(iso: str) -> datetime:
     return dt
 
 
-def _row_to_bet(row: Any) -> Bet:
-    return Bet(
-        bet_id=row["bet_id"],
-        creator_id=row["creator_id"],
-        target=row["target"],
-        created_at=_parse_datetime(row["created_at"]),
-        status=row["status"],
-    )
-
-
 def _rows_to_entries(rows: list[Any]) -> list[Entry]:
     return [
         Entry(
@@ -101,6 +89,21 @@ def _rows_to_entries(rows: list[Any]) -> list[Entry]:
         )
         for r in rows
     ]
+
+
+def _build_bet_aggregate(
+    bet_row: Any, entry_rows: list[Any], live_periods: list[str]
+) -> Bet:
+    """DB 行からドメインアグリゲートを組み立てる。"""
+    return Bet(
+        bet_id=bet_row["bet_id"],
+        creator_id=bet_row["creator_id"],
+        target=bet_row["target"],
+        created_at=_parse_datetime(bet_row["created_at"]),
+        status=bet_row["status"],
+        entries=_rows_to_entries(entry_rows),
+        live_periods=list(live_periods),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +162,6 @@ async def join_bet(
     now = _utcnow().isoformat()
 
     async def _tx(conn):
-        # Fetch bet inside transaction
         async with conn.execute(
             "SELECT * FROM bets WHERE bet_id=?", (bet_id,)
         ) as cur:
@@ -168,19 +170,16 @@ async def join_bet(
         if bet_row is None:
             raise BetNotFound(f"Bet #{bet_id} not found")
 
-        bet = _row_to_bet(bet_row)
-
-        # Fetch existing entries for first-time detection
         async with conn.execute(
             "SELECT * FROM entries WHERE bet_id=?", (bet_id,)
         ) as cur:
             entry_rows = await cur.fetchall()
 
-        entries = _rows_to_entries(entry_rows)
         live = await db.fetch_live_periods_tx(conn, bet_id)
 
-        # --- Domain logic (pure) ---
-        decision = domain_validate_join(bet, entries, live, user_id, period_key)
+        # --- Domain aggregate ---
+        bet = _build_bet_aggregate(bet_row, entry_rows, live)
+        decision = bet.place_bet(user_id, period_key)
 
         # --- Persist ---
         entry_id = await db.insert_entry_tx(
@@ -192,7 +191,6 @@ async def join_bet(
 
     entry_id, channel_id, first_time = await db.execute_write(_tx)
 
-    # Read new balance outside tx
     new_balance = await db.fetch_balance(user_id)
     refresher.schedule(channel_id, bet_id)
 
@@ -223,15 +221,13 @@ async def close_bet(
     if bet_row is None:
         raise BetNotFound(f"Bet #{bet_id} not found")
 
-    bet = _row_to_bet(bet_row)
+    entries_rows = await db.fetch_bet_entries(bet_id)
+    live_keys = await db.fetch_live_periods_tx(db.conn, bet_id)
     now = _utcnow()
 
-    entries_rows = await db.fetch_bet_entries(bet_id)
-    entries = _rows_to_entries(entries_rows)
-    live_keys = await db.fetch_live_periods_tx(db.conn, bet_id)
-
-    # --- Domain logic (pure) ---
-    decision = domain_settle(bet, entries, live_keys, actor_user_id, now)
+    # --- Domain aggregate ---
+    bet = _build_bet_aggregate(bet_row, entries_rows, live_keys)
+    decision = bet.close(actor_user_id, now)
 
     # --- Persist ---
     closed_at = now.isoformat()
@@ -250,13 +246,11 @@ async def close_bet(
 
     await db.execute_write(_settle_tx)
 
-    # Cancel scheduler tasks
     scheduler.cancel_for_bet(bet_id)
 
     # Fetch updated entries for result embed
     settled_entries = await db.fetch_bet_entries(bet_id)
 
-    # Build result embed and edit the original message
     result_embed = build_result_embed(
         bet_row, settled_entries, decision.winners, decision.elapsed_sec, decision.k
     )
@@ -277,7 +271,6 @@ async def close_bet(
             await message.edit(embed=result_embed, view=None)
         except Exception:
             logger.exception("Failed to edit original message for bet #%d", bet_id)
-        # Post a fresh public message so users get a new-message notification
         try:
             await channel.send(
                 content=f"⏰ 賭け **#{bet_id}** が終了しました",
